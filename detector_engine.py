@@ -13,28 +13,11 @@ Description:
     that ingests multiple threat intelligence feeds, correlates data, predicts
     attack probability, and generates draft detection rules for SOC teams.
 
-    The engine implements the core concepts of advanced threat intelligence
-    platforms, including:
-        1. Multi-source threat intelligence ingestion
-        2. Data normalization and correlation
-        3. Predictive risk scoring (AttackForecast)
-        4. Automated detection rule generation
-        5. Comprehensive reporting and export
-
 Data Sources:
     - CISA Known Exploited Vulnerabilities (KEV) Catalog
     - NIST National Vulnerability Database (NVD)
     - FIRST EPSS (Exploit Prediction Scoring System)
     - Abuse.ch ThreatFox (IOC feed)
-    - Abuse.ch URLhaus (malicious URL feed)
-    - Ransomware Leak Sites (tracking)
-
-Outputs:
-    - Predictive AttackForecast reports
-    - Draft Sigma rules
-    - Draft YARA rules
-    - HTML dashboards
-    - JSON exports for SIEM integration
 """
 
 import json
@@ -47,12 +30,9 @@ import hashlib
 import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
-from dataclasses import dataclass, field
 import requests
 import argparse
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import csv
 
 # ============================================================================
 # SECTION 1: CONFIGURATION
@@ -61,17 +41,15 @@ import csv
 class Configuration:
     """Centralized configuration for the GreyNOC Detector Engine."""
 
-    # Database Configuration
     DATABASE_FILE = "greynoc.db"
     OUTPUT_DIR = "reports"
     LOG_DIR = "logs"
 
-    # API Endpoints
+    # API Endpoints - FIXED
     CISA_KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
     NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-    EPSS_API_URL = "https://api.first.org/epss/v1"
+    EPSS_API_URL = "https://api.first.org/epss/v1/cve"
     THREATFOX_API_URL = "https://threatfox.abuse.ch/api/v1/"
-    URLHAUS_API_URL = "https://urlhaus-api.abuse.ch/v1/"
 
     # Risk Scoring Configuration
     WEIGHT_KEV = 5.0
@@ -93,13 +71,12 @@ class Configuration:
     # Detection Formats
     DETECTION_FORMATS = ["sigma", "yara", "splunk", "kql"]
 
-    # Logging
     LOG_LEVEL = "INFO"
     LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 
 # ============================================================================
-# SECTION 2: ENTERPRISE LOGGING
+# SECTION 2: LOGGING
 # ============================================================================
 
 class Logger:
@@ -109,14 +86,12 @@ class Logger:
         self.logger = logging.getLogger(name)
         self.logger.setLevel(getattr(logging, Configuration.LOG_LEVEL))
 
-        # Console handler
         console = logging.StreamHandler(sys.stdout)
         console.setLevel(logging.INFO)
         console_format = logging.Formatter(Configuration.LOG_FORMAT)
         console.setFormatter(console_format)
         self.logger.addHandler(console)
 
-        # File handler
         os.makedirs(Configuration.LOG_DIR, exist_ok=True)
         log_file = f"{Configuration.LOG_DIR}/greynoc_{datetime.now().strftime('%Y%m%d')}.log"
         file_handler = logging.FileHandler(log_file)
@@ -125,7 +100,6 @@ class Logger:
         file_handler.setFormatter(file_format)
         self.logger.addHandler(file_handler)
 
-        # Structured logs for SIEM
         self.structured_logs = []
 
     def info(self, message: str, **kwargs):
@@ -155,18 +129,7 @@ class Logger:
 # ============================================================================
 
 class DatabaseManager:
-    """
-    Manages SQLite database for threat intelligence data persistence.
-
-    Tables:
-        - vulns: Vulnerability data from NVD
-        - kev: CISA Known Exploited Vulnerabilities
-        - epss: EPSS scores
-        - iocs: Indicators of Compromise from ThreatFox
-        - detections: Generated detection rules
-        - forecasts: Predictive AttackForecast results
-        - metadata: Data source sync information
-    """
+    """Manages SQLite database for threat intelligence data persistence."""
 
     def __init__(self, db_file: str = Configuration.DATABASE_FILE, logger: Logger = None):
         self.db_file = db_file
@@ -178,7 +141,6 @@ class DatabaseManager:
         with sqlite3.connect(self.db_file) as conn:
             cursor = conn.cursor()
 
-            # Vulnerabilities table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS vulns (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -193,7 +155,6 @@ class DatabaseManager:
                 )
             """)
 
-            # CISA KEV table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS kev (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -202,13 +163,12 @@ class DatabaseManager:
                     product TEXT,
                     date_added TEXT,
                     due_date TEXT,
-                    known_ransomware BOOLEAN,
+                    known_ransomware INTEGER,
                     raw_data TEXT,
                     ingested_at TEXT
                 )
             """)
 
-            # EPSS table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS epss (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -220,7 +180,6 @@ class DatabaseManager:
                 )
             """)
 
-            # IOCs table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS iocs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -236,7 +195,6 @@ class DatabaseManager:
                 )
             """)
 
-            # Detections table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS detections (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -253,7 +211,6 @@ class DatabaseManager:
                 )
             """)
 
-            # AttackForecast table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS forecasts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -268,7 +225,6 @@ class DatabaseManager:
                 )
             """)
 
-            # Metadata table for sync tracking
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS metadata (
                     key TEXT PRIMARY KEY,
@@ -281,7 +237,6 @@ class DatabaseManager:
             self.logger.info("Database initialized successfully")
 
     def execute_query(self, query: str, params: tuple = ()) -> List[Dict]:
-        """Execute a SELECT query and return results as dictionaries."""
         with sqlite3.connect(self.db_file) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
@@ -289,7 +244,6 @@ class DatabaseManager:
             return [dict(row) for row in cursor.fetchall()]
 
     def execute_write(self, query: str, params: tuple = ()) -> int:
-        """Execute an INSERT, UPDATE, or DELETE query."""
         with sqlite3.connect(self.db_file) as conn:
             cursor = conn.cursor()
             cursor.execute(query, params)
@@ -297,7 +251,6 @@ class DatabaseManager:
             return cursor.lastrowid
 
     def insert_or_update_vuln(self, vuln: Dict):
-        """Insert or update a vulnerability record."""
         query = """
             INSERT OR REPLACE INTO vulns (
                 cve_id, description, cvss_score, cvss_severity,
@@ -317,7 +270,6 @@ class DatabaseManager:
         self.execute_write(query, params)
 
     def insert_or_update_kev(self, kev: Dict):
-        """Insert or update a CISA KEV record."""
         query = """
             INSERT OR REPLACE INTO kev (
                 cve_id, vendor, product, date_added, due_date,
@@ -337,7 +289,6 @@ class DatabaseManager:
         self.execute_write(query, params)
 
     def insert_or_update_epss(self, epss: Dict):
-        """Insert or update an EPSS record."""
         query = """
             INSERT OR REPLACE INTO epss (
                 cve_id, epss_score, percentile, date, ingested_at
@@ -353,7 +304,6 @@ class DatabaseManager:
         self.execute_write(query, params)
 
     def insert_ioc(self, ioc: Dict):
-        """Insert an IOC record."""
         query = """
             INSERT OR REPLACE INTO iocs (
                 indicator, indicator_type, threat_type, malware,
@@ -374,7 +324,6 @@ class DatabaseManager:
         self.execute_write(query, params)
 
     def insert_detection(self, detection: Dict) -> str:
-        """Insert a detection rule."""
         detection_id = f"DET-{datetime.now().strftime('%Y%m%d')}-{random.randint(1000, 9999)}"
         query = """
             INSERT OR REPLACE INTO detections (
@@ -398,7 +347,6 @@ class DatabaseManager:
         return detection_id
 
     def insert_forecast(self, forecast: Dict) -> str:
-        """Insert an AttackForecast record."""
         forecast_id = f"FC-{datetime.now().strftime('%Y%m%d')}-{random.randint(1000, 9999)}"
         query = """
             INSERT OR REPLACE INTO forecasts (
@@ -420,7 +368,6 @@ class DatabaseManager:
         return forecast_id
 
     def get_vuln_with_enrichment(self, cve_id: str) -> Optional[Dict]:
-        """Get a vulnerability with all enrichment data."""
         query = """
             SELECT
                 v.*,
@@ -436,7 +383,6 @@ class DatabaseManager:
         return results[0] if results else None
 
     def get_all_forecasts(self, limit: int = 100) -> List[Dict]:
-        """Get all forecasts sorted by risk score."""
         query = """
             SELECT * FROM forecasts
             ORDER BY risk_score DESC
@@ -445,32 +391,21 @@ class DatabaseManager:
         return self.execute_query(query, (limit,))
 
     def get_metadata(self, key: str) -> Optional[str]:
-        """Get metadata value."""
         results = self.execute_query("SELECT value FROM metadata WHERE key = ?", (key,))
         return results[0]['value'] if results else None
 
     def set_metadata(self, key: str, value: str):
-        """Set metadata value."""
         query = "INSERT OR REPLACE INTO metadata (key, value, updated_at) VALUES (?, ?, ?)"
         params = (key, value, datetime.now().isoformat())
         self.execute_write(query, params)
 
 
 # ============================================================================
-# SECTION 4: THREAT INTELLIGENCE INGESTION ENGINE
+# SECTION 4: THREAT INTELLIGENCE INGESTION
 # ============================================================================
 
 class ThreatIntelligenceIngestor:
-    """
-    Ingests data from multiple threat intelligence sources.
-
-    Sources:
-        - CISA KEV Catalog
-        - NIST NVD
-        - FIRST EPSS
-        - Abuse.ch ThreatFox
-        - Abuse.ch URLhaus
-    """
+    """Ingests data from multiple threat intelligence sources."""
 
     def __init__(self, db_manager: DatabaseManager, logger: Logger):
         self.db = db_manager
@@ -479,12 +414,7 @@ class ThreatIntelligenceIngestor:
         self.session.headers.update({"User-Agent": "GreyNOC-Detector-Engine/2.0"})
 
     def ingest_cisa_kev(self) -> int:
-        """
-        Ingest CISA Known Exploited Vulnerabilities catalog.
-
-        Returns:
-            int: Number of records ingested
-        """
+        """Ingest CISA KEV catalog."""
         self.logger.info("Ingesting CISA KEV catalog...")
         try:
             response = self.session.get(Configuration.CISA_KEV_URL, timeout=30)
@@ -514,17 +444,14 @@ class ThreatIntelligenceIngestor:
             self.logger.error(f"CISA KEV ingestion failed: {str(e)}")
             return 0
 
-    def ingest_epss(self) -> int:
-        """
-        Ingest EPSS scores from FIRST.org.
+    def ingest_epss_batch(self, cve_list: List[str]) -> int:
+        """Ingest EPSS scores for a batch of CVEs."""
+        if not cve_list:
+            return 0
 
-        Returns:
-            int: Number of records ingested
-        """
-        self.logger.info("Ingesting EPSS scores...")
         try:
-            # EPSS API requires a date range
-            params = {'date': datetime.now().strftime('%Y-%m-%d')}
+            cve_string = ','.join(cve_list[:100])
+            params = {'cve': cve_string}
             response = self.session.get(Configuration.EPSS_API_URL, params=params, timeout=30)
             response.raise_for_status()
             data = response.json()
@@ -541,102 +468,125 @@ class ThreatIntelligenceIngestor:
                     self.db.insert_or_update_epss(epss)
                     count += 1
 
-            self.db.set_metadata('epss_last_ingest', datetime.now().isoformat())
-            self.logger.info(f"Ingested {count} EPSS records")
             return count
 
         except Exception as e:
-            self.logger.error(f"EPSS ingestion failed: {str(e)}")
+            self.logger.error(f"EPSS batch ingestion failed: {str(e)}")
             return 0
 
-    def ingest_nvd(self, days_back: int = 30) -> int:
-        """
-        Ingest NVD vulnerability data.
+    def ingest_epss(self) -> int:
+        """Ingest EPSS scores for all CVEs in the database."""
+        self.logger.info("Ingesting EPSS scores...")
 
-        Args:
-            days_back: Number of days to look back
+        # Get all CVEs from KEV
+        kev_cves = self.db.execute_query("SELECT cve_id FROM kev")
+        if not kev_cves:
+            self.logger.warning("No KEV CVEs found for EPSS enrichment")
+            return 0
 
-        Returns:
-            int: Number of records ingested
-        """
-        self.logger.info(f"Ingesting NVD data (last {days_back} days)...")
+        cve_list = [row['cve_id'] for row in kev_cves]
+        total_count = 0
+
+        # Process in batches of 100
+        for i in range(0, len(cve_list), 100):
+            batch = cve_list[i:i+100]
+            count = self.ingest_epss_batch(batch)
+            total_count += count
+            time.sleep(0.5)  # Rate limiting
+
+        self.db.set_metadata('epss_last_ingest', datetime.now().isoformat())
+        self.logger.info(f"Ingested {total_count} EPSS records")
+        return total_count
+
+    def ingest_nvd_batch(self, cve_list: List[str]) -> int:
+        """Ingest NVD data for a batch of CVEs."""
+        if not cve_list:
+            return 0
+
         try:
-            start_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
-            params = {
-                'pubStartDate': start_date,
-                'resultsPerPage': 1000
-            }
+            cve_string = ','.join(cve_list[:50])
+            params = {'cveId': cve_string}
+            response = self.session.get(Configuration.NVD_API_URL, params=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
 
             count = 0
-            while True:
-                response = self.session.get(Configuration.NVD_API_URL, params=params, timeout=30)
-                response.raise_for_status()
-                data = response.json()
+            for vuln in data.get('vulnerabilities', []):
+                cve_data = vuln.get('cve', {})
+                cve_id = cve_data.get('id', '')
 
-                for vuln in data.get('vulnerabilities', []):
-                    cve_data = vuln.get('cve', {})
-                    cve_id = cve_data.get('id', '')
+                description = ''
+                for desc in cve_data.get('descriptions', []):
+                    if desc.get('lang') == 'en':
+                        description = desc.get('value', '')
+                        break
 
-                    # Extract description
-                    description = ''
-                    for desc in cve_data.get('descriptions', []):
-                        if desc.get('lang') == 'en':
-                            description = desc.get('value', '')
-                            break
+                cvss_score = 0.0
+                cvss_severity = ''
+                metrics = cve_data.get('metrics', {})
+                cvss_v3 = metrics.get('cvssMetricV31', []) or metrics.get('cvssMetricV3', [])
+                if cvss_v3:
+                    cvss = cvss_v3[0].get('cvssData', {})
+                    cvss_score = cvss.get('baseScore', 0.0)
+                    cvss_severity = cvss.get('baseSeverity', '')
 
-                    # Extract CVSS
-                    cvss_score = 0.0
-                    cvss_severity = ''
-                    metrics = cve_data.get('metrics', {})
-                    cvss_v3 = metrics.get('cvssMetricV31', []) or metrics.get('cvssMetricV3', [])
-                    if cvss_v3:
-                        cvss = cvss_v3[0].get('cvssData', {})
-                        cvss_score = cvss.get('baseScore', 0.0)
-                        cvss_severity = cvss.get('baseSeverity', '')
+                vuln_record = {
+                    'cve_id': cve_id,
+                    'description': description,
+                    'cvss_score': cvss_score,
+                    'cvss_severity': cvss_severity,
+                    'published_date': cve_data.get('published', ''),
+                    'last_modified': cve_data.get('lastModified', ''),
+                    'raw_data': json.dumps(cve_data)
+                }
+                if vuln_record['cve_id']:
+                    self.db.insert_or_update_vuln(vuln_record)
+                    count += 1
 
-                    vuln_record = {
-                        'cve_id': cve_id,
-                        'description': description,
-                        'cvss_score': cvss_score,
-                        'cvss_severity': cvss_severity,
-                        'published_date': cve_data.get('published', ''),
-                        'last_modified': cve_data.get('lastModified', ''),
-                        'raw_data': json.dumps(cve_data)
-                    }
-                    if vuln_record['cve_id']:
-                        self.db.insert_or_update_vuln(vuln_record)
-                        count += 1
-
-                # Check for next page
-                meta = data.get('meta', {})
-                if not meta.get('hasMore', False):
-                    break
-                params['startIndex'] = meta.get('startIndex', 0) + meta.get('resultsPerPage', 1000)
-
-            self.db.set_metadata('nvd_last_ingest', datetime.now().isoformat())
-            self.logger.info(f"Ingested {count} NVD records")
             return count
 
         except Exception as e:
-            self.logger.error(f"NVD ingestion failed: {str(e)}")
+            self.logger.error(f"NVD batch ingestion failed: {str(e)}")
             return 0
 
+    def ingest_nvd(self) -> int:
+        """Ingest NVD data for all CVEs in the database."""
+        self.logger.info("Ingesting NVD data...")
+
+        # Get all CVEs from KEV
+        kev_cves = self.db.execute_query("SELECT cve_id FROM kev")
+        if not kev_cves:
+            self.logger.warning("No KEV CVEs found for NVD enrichment")
+            return 0
+
+        cve_list = [row['cve_id'] for row in kev_cves]
+        total_count = 0
+
+        # Process in batches of 50
+        for i in range(0, len(cve_list), 50):
+            batch = cve_list[i:i+50]
+            count = self.ingest_nvd_batch(batch)
+            total_count += count
+            time.sleep(0.5)
+
+        self.db.set_metadata('nvd_last_ingest', datetime.now().isoformat())
+        self.logger.info(f"Ingested {total_count} NVD records")
+        return total_count
+
     def ingest_threatfox(self, limit: int = 100) -> int:
-        """
-        Ingest IOCs from Abuse.ch ThreatFox.
-
-        Args:
-            limit: Maximum number of IOCs to fetch
-
-        Returns:
-            int: Number of records ingested
-        """
+        """Ingest IOCs from ThreatFox."""
         self.logger.info(f"Ingesting ThreatFox data (limit: {limit})...")
         try:
             payload = {"query": "get_iocs", "limit": limit}
             response = self.session.post(Configuration.THREATFOX_API_URL, json=payload, timeout=30)
-            response.raise_for_status()
+            if response.status_code != 200:
+                self.logger.warning(f"ThreatFox returned status {response.status_code}")
+                return 0
+
             data = response.json()
+            if data.get('query_status') != 'ok':
+                self.logger.warning(f"ThreatFox query failed: {data.get('query_status', 'unknown')}")
+                return 0
 
             count = 0
             for ioc in data.get('data', []):
@@ -663,12 +613,7 @@ class ThreatIntelligenceIngestor:
             return 0
 
     def run_full_ingest(self) -> Dict:
-        """
-        Run a complete ingestion cycle across all sources.
-
-        Returns:
-            Dict: Ingest statistics
-        """
+        """Run a complete ingestion cycle."""
         self.logger.info("Starting full threat intelligence ingestion...")
 
         results = {
@@ -683,43 +628,25 @@ class ThreatIntelligenceIngestor:
 
 
 # ============================================================================
-# SECTION 5: PREDICTIVE ENGINE (AttackForecast)
+# SECTION 5: PREDICTIVE ENGINE
 # ============================================================================
 
 class PredictiveEngine:
-    """
-    Generates AttackForecast predictions based on correlated threat intelligence.
-
-    The engine combines multiple data sources to predict:
-        - Probability of exploitation
-        - Time horizon for exploitation
-        - Risk score and level
-        - Key drivers for the prediction
-    """
+    """Generates AttackForecast predictions based on correlated threat intelligence."""
 
     def __init__(self, db_manager: DatabaseManager, logger: Logger):
         self.db = db_manager
         self.logger = logger
 
     def generate_forecast(self, cve_id: str) -> Dict:
-        """
-        Generate an AttackForecast for a specific CVE.
-
-        Args:
-            cve_id: The CVE identifier
-
-        Returns:
-            Dict: Forecast data including probability, time horizon, and drivers
-        """
+        """Generate an AttackForecast for a specific CVE."""
         self.logger.info(f"Generating forecast for {cve_id}")
 
-        # Get enriched vulnerability data
         vuln = self.db.get_vuln_with_enrichment(cve_id)
         if not vuln:
             self.logger.warning(f"No vulnerability data found for {cve_id}")
             return None
 
-        # Calculate risk components
         risk_score = self._calculate_risk_score(vuln)
         probability = self._calculate_probability(vuln)
         time_horizon = self._calculate_time_horizon(vuln)
@@ -735,7 +662,6 @@ class PredictiveEngine:
             'key_drivers': key_drivers
         }
 
-        # Save to database
         forecast_id = self.db.insert_forecast(forecast)
         forecast['forecast_id'] = forecast_id
 
@@ -743,23 +669,13 @@ class PredictiveEngine:
         return forecast
 
     def generate_all_forecasts(self, limit: int = 100) -> List[Dict]:
-        """
-        Generate forecasts for all CVEs with enrichment data.
-
-        Args:
-            limit: Maximum number of forecasts to generate
-
-        Returns:
-            List[Dict]: List of forecasts
-        """
+        """Generate forecasts for all CVEs with enrichment data."""
         self.logger.info("Generating forecasts for all CVEs...")
 
-        # Get all CVEs with enrichment
         query = """
             SELECT DISTINCT v.cve_id
             FROM vulns v
             LEFT JOIN kev k ON v.cve_id = k.cve_id
-            LEFT JOIN epss e ON v.cve_id = e.cve_id
             WHERE v.cvss_score IS NOT NULL
             ORDER BY v.cvss_score DESC
             LIMIT ?
@@ -776,42 +692,28 @@ class PredictiveEngine:
         return forecasts
 
     def _calculate_risk_score(self, vuln: Dict) -> float:
-        """
-        Calculate risk score based on multiple factors.
-
-        Formula: Risk = (KEV_Weight × KEV_Status) + (EPSS_Weight × EPSS_Score) +
-                  (CVSS_Weight × CVSS_Score) + (Active_Exploitation_Weight)
-        """
         risk = 0.0
 
-        # KEV contribution
         if vuln.get('kev_date_added'):
             risk += Configuration.WEIGHT_KEV
 
-        # EPSS contribution
         epss_score = vuln.get('epss_score', 0.0)
         risk += epss_score * 10 * Configuration.WEIGHT_EPSS
 
-        # CVSS contribution
         cvss_score = vuln.get('cvss_score', 0.0)
         risk += cvss_score * Configuration.WEIGHT_CVSS
 
-        # Active exploitation flag
         if vuln.get('known_ransomware'):
             risk += Configuration.WEIGHT_ACTIVE_EXPLOITATION
 
         return min(10.0, round(risk, 2))
 
     def _calculate_probability(self, vuln: Dict) -> float:
-        """Calculate exploitation probability."""
-        # Base probability from EPSS
         epss_score = vuln.get('epss_score', 0.0)
 
-        # Boost for KEV status
         if vuln.get('kev_date_added'):
             epss_score = min(1.0, epss_score + 0.3)
 
-        # Boost for high CVSS
         cvss_score = vuln.get('cvss_score', 0.0)
         if cvss_score >= 9.0:
             epss_score = min(1.0, epss_score + 0.15)
@@ -819,26 +721,18 @@ class PredictiveEngine:
         return round(epss_score, 2)
 
     def _calculate_time_horizon(self, vuln: Dict) -> int:
-        """Calculate the predicted time horizon for exploitation."""
-        # Default to medium horizon
         horizon = Configuration.HORIZON_MEDIUM
 
-        # KEV status means immediate threat
         if vuln.get('kev_date_added'):
             horizon = Configuration.HORIZON_IMMEDIATE
-
-        # High EPSS means short horizon
         elif vuln.get('epss_score', 0.0) > 0.5:
             horizon = Configuration.HORIZON_SHORT
-
-        # High CVSS means medium horizon
         elif vuln.get('cvss_score', 0.0) > 7.0:
             horizon = Configuration.HORIZON_MEDIUM
 
         return horizon
 
     def _determine_risk_level(self, score: float) -> str:
-        """Determine risk level from score."""
         if score >= Configuration.THRESHOLD_CRITICAL:
             return "CRITICAL"
         elif score >= Configuration.THRESHOLD_HIGH:
@@ -849,7 +743,6 @@ class PredictiveEngine:
             return "LOW"
 
     def _identify_drivers(self, vuln: Dict) -> List[str]:
-        """Identify key drivers for the prediction."""
         drivers = []
 
         if vuln.get('kev_date_added'):
@@ -879,30 +772,14 @@ class PredictiveEngine:
 # ============================================================================
 
 class DetectionGenerator:
-    """
-    Generates draft detection rules in multiple formats.
-
-    Supported formats:
-        - Sigma: Log-based detection rules
-        - YARA: File-based detection rules
-        - Splunk: SPL queries
-        - KQL: Kusto Query Language
-    """
+    """Generates draft detection rules in multiple formats."""
 
     def __init__(self, db_manager: DatabaseManager, logger: Logger):
         self.db = db_manager
         self.logger = logger
 
     def generate_detections(self, forecast: Dict) -> Dict:
-        """
-        Generate detection rules for a forecast.
-
-        Args:
-            forecast: The AttackForecast data
-
-        Returns:
-            Dict: Generated detections by format
-        """
+        """Generate detection rules for a forecast."""
         self.logger.info(f"Generating detections for {forecast['cve_id']}")
 
         detections = {}
@@ -912,7 +789,6 @@ class DetectionGenerator:
                 detection = self._generate_detection(forecast, format_type)
                 if detection:
                     detections[format_type] = detection
-                    # Save to database
                     detection_id = self.db.insert_detection(detection)
                     detections[format_type]['detection_id'] = detection_id
             except Exception as e:
@@ -921,12 +797,6 @@ class DetectionGenerator:
         return detections
 
     def _generate_detection(self, forecast: Dict, format_type: str) -> Dict:
-        """
-        Generate a detection rule in the specified format.
-        """
-        cve_id = forecast.get('cve_id')
-        risk_level = forecast.get('risk_level')
-
         generators = {
             'sigma': self._generate_sigma,
             'yara': self._generate_yara,
@@ -941,7 +811,6 @@ class DetectionGenerator:
         return generator(forecast)
 
     def _generate_sigma(self, forecast: Dict) -> Dict:
-        """Generate a Sigma rule."""
         cve_id = forecast['cve_id']
         risk_level = forecast['risk_level']
 
@@ -977,7 +846,6 @@ level: {risk_level.lower()}
         }
 
     def _generate_yara(self, forecast: Dict) -> Dict:
-        """Generate a YARA rule."""
         cve_id = forecast['cve_id']
         risk_level = forecast['risk_level']
 
@@ -1006,7 +874,6 @@ level: {risk_level.lower()}
         }
 
     def _generate_splunk(self, forecast: Dict) -> Dict:
-        """Generate a Splunk SPL query."""
         cve_id = forecast['cve_id']
         risk_level = forecast['risk_level']
 
@@ -1028,7 +895,6 @@ level: {risk_level.lower()}
         }
 
     def _generate_kql(self, forecast: Dict) -> Dict:
-        """Generate a KQL query."""
         cve_id = forecast['cve_id']
         risk_level = forecast['risk_level']
 
@@ -1053,12 +919,7 @@ DeviceEvents
         }
 
     def generate_detection_package(self, forecasts: List[Dict]) -> Dict:
-        """
-        Generate detections for multiple forecasts.
-
-        Returns:
-            Dict: Package of all generated detections
-        """
+        """Generate detections for multiple forecasts."""
         self.logger.info(f"Generating detection package for {len(forecasts)} forecasts")
 
         package = {
@@ -1080,9 +941,7 @@ DeviceEvents
 # ============================================================================
 
 class ReportingEngine:
-    """
-    Generates comprehensive reports in multiple formats.
-    """
+    """Generates comprehensive reports in multiple formats."""
 
     def __init__(self, db_manager: DatabaseManager, logger: Logger):
         self.db = db_manager
@@ -1103,7 +962,6 @@ class ReportingEngine:
             report.append("No forecasts available.")
             return "\n".join(report)
 
-        # Summary statistics
         risk_levels = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
         for f in forecasts:
             risk_levels[f.get('risk_level', 'LOW')] += 1
@@ -1116,7 +974,6 @@ class ReportingEngine:
         report.append(f"  Medium: {risk_levels['MEDIUM']}")
         report.append(f"  Low: {risk_levels['LOW']}")
 
-        # Top threats
         report.append("")
         report.append("TOP THREATS:")
         for i, f in enumerate(forecasts[:10], 1):
@@ -1198,7 +1055,6 @@ class ReportingEngine:
             risk_level = f.get('risk_level', 'LOW').lower()
             score = f.get('risk_score', 0.0)
             probability = f.get('probability', 0.0)
-            color = {'critical': '#ff0040', 'high': '#ff6600', 'medium': '#ffcc00', 'low': '#00cc66'}.get(risk_level, '#00cc66')
 
             html += f"""
     <div class="forecast forecast-{risk_level}">
@@ -1233,9 +1089,7 @@ class ReportingEngine:
 # ============================================================================
 
 class GreyNOCDetectorEngine:
-    """
-    Main orchestrator for the GreyNOC Detector Engine.
-    """
+    """Main orchestrator for the GreyNOC Detector Engine."""
 
     def __init__(self):
         self.logger = Logger()
@@ -1246,40 +1100,25 @@ class GreyNOCDetectorEngine:
         self.reporting = ReportingEngine(self.db, self.logger)
 
     def run_full_pipeline(self) -> Dict:
-        """
-        Run the complete GreyNOC pipeline:
-        1. Ingest threat intelligence
-        2. Generate forecasts
-        3. Generate detections
-        4. Create reports
-        """
+        """Run the complete GreyNOC pipeline."""
         self.logger.info("Starting full GreyNOC pipeline...")
 
-        # Step 1: Ingest
         ingest_results = self.ingestor.run_full_ingest()
-
-        # Step 2: Generate forecasts
         forecasts = self.predictive.generate_all_forecasts(limit=50)
-
-        # Step 3: Generate detections
         detection_package = self.detection.generate_detection_package(forecasts[:10])
 
-        # Step 4: Generate reports
         os.makedirs(Configuration.OUTPUT_DIR, exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-        # Console report
         console_report = self.reporting.generate_console_report(forecasts)
         print(console_report)
 
-        # HTML report
         html_content = self.reporting.generate_html_report(forecasts)
         html_file = f"{Configuration.OUTPUT_DIR}/greynoc_report_{timestamp}.html"
         with open(html_file, 'w') as f:
             f.write(html_content)
         self.logger.info(f"HTML report saved: {html_file}")
 
-        # JSON report
         json_content = self.reporting.generate_json_report(forecasts, detection_package)
         json_file = f"{Configuration.OUTPUT_DIR}/greynoc_export_{timestamp}.json"
         with open(json_file, 'w') as f:
@@ -1297,7 +1136,6 @@ class GreyNOCDetectorEngine:
         """Run a demonstration with mock data."""
         self.logger.info("Running GreyNOC demo with mock data...")
 
-        # Generate mock forecasts
         mock_forecasts = []
         for i in range(10):
             cve_id = f"CVE-2026-{random.randint(1000, 9999)}"
@@ -1315,10 +1153,8 @@ class GreyNOCDetectorEngine:
             }
             mock_forecasts.append(forecast)
 
-        # Generate detections
         detection_package = self.detection.generate_detection_package(mock_forecasts[:5])
 
-        # Generate reports
         os.makedirs(Configuration.OUTPUT_DIR, exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
@@ -1333,6 +1169,10 @@ class GreyNOCDetectorEngine:
 
         return mock_forecasts
 
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
 
 def main():
     """Main entry point."""
